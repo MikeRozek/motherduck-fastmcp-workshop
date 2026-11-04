@@ -8,13 +8,14 @@ from collections import Counter, defaultdict
 from statistics import median
 from typing import Annotated, Literal
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.utilities.logging import get_logger
+from mcp.types import InputRequiredResult
 from pydantic import Field
 
 from sf311.data import BY_ID, LOCAL_NAMES, NEIGHBORHOODS, REQUESTS, SERVICES, Request, closest
-from sf311.kit import caller_email
+from sf311.kit import ask_choice, caller_email, read_choice
 
 mcp = FastMCP("sf-311")
 log = get_logger("sf311")
@@ -171,6 +172,90 @@ def count_open(
     counts = Counter(key(r) for r in still_open if key(r))
     ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
     return dict(ranked[:MAX_ROWS])
+
+
+BOUNDARY_KEY = "boundary"
+
+
+def _parts(local_name: str) -> list[str]:
+    """Official neighborhoods a local name overlaps, most requests first."""
+    counts = Counter(r.neighborhood for r in REQUESTS if r.local_name == local_name and r.neighborhood)
+    return [name for name, _ in sorted(counts.items(), key=lambda item: (-item[1], item[0]))]
+
+
+def _count_local(local_name: str, part: str | None) -> int:
+    """Requests in a local area, optionally only those inside one official neighborhood."""
+    return sum(1 for r in REQUESTS if r.local_name == local_name and (part is None or r.neighborhood == part))
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def count_in_neighborhood(
+    name: Annotated[
+        str,
+        Field(description="An official neighborhood, such as 'Mission', or a local name people use, such as 'Lower Nob Hill'."),
+    ],
+    ctx: Context,
+    boundary: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Only for a local name that spans several official neighborhoods: one of those "
+                "neighborhoods to count just that part, or 'all' for the whole area. Omit to ask the user."
+            )
+        ),
+    ] = None,
+) -> int | str | InputRequiredResult:
+    """Count this week's 311 requests in a neighborhood, by official or local name.
+
+    Use this when the user names a place in their own words, such as "Lower Nob
+    Hill" or "Duboce Triangle". An official name is counted directly. A local
+    name inside one official neighborhood is counted directly too. A local name
+    that spans several official neighborhoods asks the user which part to count,
+    unless you pass boundary.
+
+    Returns the count as a number, or a short message if the user declined to
+    choose; in that case nothing was counted, and you can call again with
+    boundary="all" or a specific neighborhood. For other filters or groupings
+    by official neighborhood, use count_requests.
+    """
+    key = name.strip().lower()
+    official = {n.lower(): n for n in NEIGHBORHOODS}.get(key)
+    if official:
+        return sum(1 for r in REQUESTS if r.neighborhood == official)
+
+    local = {n.lower(): n for n in LOCAL_NAMES}.get(key)
+    if local is None:
+        suggestions = closest(name, NEIGHBORHOODS + LOCAL_NAMES)
+        hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+        raise ToolError(f"Unknown neighborhood '{name}'.{hint} Call dataset_info for the official names.")
+
+    parts = _parts(local)
+    if len(parts) <= 1:
+        return _count_local(local, None)
+
+    everything = f"All of {local}"
+    if boundary is None:
+        choice = read_choice(ctx, BOUNDARY_KEY)
+        if choice is None:
+            return ask_choice(
+                BOUNDARY_KEY,
+                f"{local} spans {len(parts)} official neighborhoods. Which part should I count?",
+                parts + [everything],
+            )
+        if not choice.accepted:
+            return (
+                f"Nothing was counted: the user did not choose which part of {local} to count. "
+                f"Call again with boundary='all' or one of: {', '.join(parts)}."
+            )
+        boundary = choice.value
+
+    picked = boundary.strip()
+    if picked.lower() in ("all", everything.lower()):
+        return _count_local(local, None)
+    part = {p.lower(): p for p in parts}.get(picked.lower())
+    if part is None:
+        raise ToolError(f"'{boundary}' is not part of {local}. Use 'all' or one of: {', '.join(parts)}.")
+    return _count_local(local, part)
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
