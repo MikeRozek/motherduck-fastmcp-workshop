@@ -3,17 +3,21 @@
 FastMCP Gateway runs this file. Its entrypoint setting is `server.py:mcp`.
 """
 
+import re
 from collections import Counter, defaultdict
 from statistics import median
 from typing import Annotated, Literal
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.utilities.logging import get_logger
 from pydantic import Field
 
 from sf311.data import BY_ID, LOCAL_NAMES, NEIGHBORHOODS, REQUESTS, SERVICES, Request, closest
+from sf311.kit import caller_email
 
 mcp = FastMCP("sf-311")
+log = get_logger("sf311")
 
 MAX_ROWS = 50
 MIN_CLOSED_FOR_MEDIAN = 10
@@ -36,6 +40,28 @@ NeighborhoodArg = Annotated[
     str | None,
     Field(description="Exact official neighborhood name from dataset_info, such as 'Mission'. Omit for all neighborhoods."),
 ]
+
+
+HOUSE_NUMBER = re.compile(r"^(\d+)\s+([^,]+)")
+
+
+def mask_address(address: str) -> str:
+    """Cut an address down to its block: "994 HARRISON ST, SAN FRANCISCO, ..." -> "900 block of HARRISON ST".
+
+    Addresses without a leading house number, such as intersections, are returned unchanged.
+    """
+    match = HOUSE_NUMBER.match(address or "")
+    if not match:
+        return address
+    block = int(match.group(1)) // 100 * 100
+    return f"{block} block of {match.group(2).strip()}"
+
+
+def _public(request: Request) -> dict:
+    """Return a request as a dict with its address masked to the block, safe to show the model."""
+    row = request.as_dict()
+    row["address"] = mask_address(row["address"])
+    return row
 
 
 def _resolve(value: str | None, choices: list[str], kind: str) -> str | None:
@@ -163,12 +189,14 @@ def search_requests(
     any number.
 
     Each row has request_id, opened, closed, status, service, subtype, agency,
-    neighborhood, local_name, address, and source. Pass a request_id to
+    neighborhood, local_name, address, and source. Addresses are given only to
+    the block, such as "900 block of HARRISON ST"; exact house numbers are
+    never available. Pass a request_id to
     get_request to fetch one request again.
     """
     rows = _matching(service, neighborhood, status)
     rows.sort(key=lambda r: r.opened, reverse=True)
-    return [r.as_dict() for r in rows[:limit]]
+    return [_public(r) for r in rows[:limit]]
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
@@ -177,13 +205,16 @@ def get_request(
 ) -> dict:
     """Fetch one 311 request by its request_id, with all its fields.
 
+    The address is given only to the block, such as "900 block of HARRISON ST".
+
     Use this when you already have an id. To find requests, use
     search_requests; to count them, use count_requests.
     """
+    log.info("get_request request_id=%s caller=%s", request_id, caller_email() or "local")
     request = BY_ID.get(request_id.strip())
     if request is None:
         raise ToolError(f"No request with id '{request_id}'. Use search_requests to find real request ids.")
-    return request.as_dict()
+    return _public(request)
 
 
 if __name__ == "__main__":
