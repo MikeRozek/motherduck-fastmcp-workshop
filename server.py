@@ -139,6 +139,41 @@ def count_requests(
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
+def count_open(
+    service: ServiceArg = None,
+    neighborhood: NeighborhoodArg = None,
+    group_by: Annotated[
+        Literal["neighborhood", "service", "agency"] | None,
+        Field(description="Split the open count by this field. Omit to get one total."),
+    ] = None,
+) -> dict:
+    """Count requests opened this week that are still open (not yet closed).
+
+    Use this for "how many are still open", "what is unresolved", or "what
+    share is still open" questions, such as count_open(service="Tree Maintenance").
+
+    Without group_by, returns {"open": n, "opened_this_week": total, "open_share": fraction 0-1},
+    so you can quote both the backlog and the rate. With group_by, returns a dict
+    of group to open count, largest first, at most 50 groups.
+
+    Use count_requests for all requests regardless of status, and
+    median_close_hours for how fast closed requests were resolved.
+    """
+    rows = _matching(service, neighborhood)
+    still_open = [r for r in rows if r.status == "Open"]
+    if group_by is None:
+        return {
+            "open": len(still_open),
+            "opened_this_week": len(rows),
+            "open_share": round(len(still_open) / len(rows), 3) if rows else None,
+        }
+    key = GROUPS[group_by]
+    counts = Counter(key(r) for r in still_open if key(r))
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return dict(ranked[:MAX_ROWS])
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
 def median_close_hours(
     service: ServiceArg = None,
     group_by: Annotated[
